@@ -3,7 +3,8 @@ Sweep number of pi pulses
 =========================
 
 For each sweep point, this program sends a PMOD trigger and then plays
-N identical microwave pi pulses, where N is swept from n_pi_start to n_pi_end.
+N microwave pi pulses with alternating XY phases, where N is swept from
+n_pi_start to n_pi_end.
 
 This version does not include laser/ADC readout. It is meant to be used with
 external readout/triggering, similar to the arqick_*_200ps pulse-only programs.
@@ -72,10 +73,11 @@ class PiPulseNumberSweep(NVAveragerProgram):
 
         PMOD trigger
         wait trigger-to-pulse delay
-        play N pi pulses
+        play pi_X, delay, pi_Y, delay, ... for N total pi pulses
         wait pulse-sequence delay
 
-    where N is swept by a hardware register.
+    where N is swept by a hardware register. The sweep axis returned by
+    get_expt_pts() is the actual number of pi pulses N.
     """
 
     required_cfg = [
@@ -172,6 +174,15 @@ class PiPulseNumberSweep(NVAveragerProgram):
             init_val=0,
         )
 
+        self.phase_register = self.get_gen_reg(self.cfg.mw_channel, name="phase")
+
+        # 0 -> X phase, 1 -> Y phase. This toggles once per pi pulse.
+        self.phase_step_register = self.new_gen_reg(
+            self.cfg.mw_channel,
+            name="phase_step",
+            init_val=0,
+        )
+
         self.add_sweep(
             IntRegisterSweep(
                 self,
@@ -212,6 +223,9 @@ class PiPulseNumberSweep(NVAveragerProgram):
             physical_unit=False,
         )
 
+        # Start every train on X.
+        self.phase_step_register.reset()
+
         # If n_pi == 0, skip the pulse loop.
         self.condj(
             self.pi_counter_register.page,
@@ -223,7 +237,15 @@ class PiPulseNumberSweep(NVAveragerProgram):
 
         self.label("PI_LOOP")
 
-        # Play one pi pulse.
+        # Play one pi pulse. DDS phase register uses 90 deg == 1 << 30,
+        # so phase_step 0/1 maps directly to X/Y.
+        self.bitwi(
+            self.phase_register.page,
+            self.phase_register.addr,
+            self.phase_step_register.addr,
+            "<<",
+            30,
+        )
         self.pulse(ch=self.cfg.mw_channel)
 
         # Wait until the pulse is done.
@@ -248,6 +270,21 @@ class PiPulseNumberSweep(NVAveragerProgram):
 
         # Delay before the next pi pulse.
         self.sync_all(self.cfg.pi_to_pi_delay_treg)
+
+        # Toggle X <-> Y for the next pi pulse.
+        self.phase_step_register.set_to(
+            self.phase_step_register,
+            "+",
+            1,
+            physical_unit=False,
+        )
+        self.bitwi(
+            self.phase_step_register.page,
+            self.phase_step_register.addr,
+            self.phase_step_register.addr,
+            "&",
+            1,
+        )
 
         # If counter is still positive, loop.
         self.condj(
