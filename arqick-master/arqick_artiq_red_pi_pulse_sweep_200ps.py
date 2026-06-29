@@ -10,7 +10,7 @@ from repository.arqick_sequences.arqick_artiq_red_config import ARQICK_DoPulses_
 class ARQICK_red_pi_pulse_sweep_200ps(EnvExperiment, ARQICK_DoPulses_Red):
     def build(self):
         self.setattr_argument("pi_duration_tdds", NumberValue(190, precision=0, step=1, min=1))
-        self.setattr_argument("pi_to_pi_delay_treg", NumberValue(0, precision=0, step=1, min=0))
+        self.setattr_argument("pi_to_pi_delay_tdds", NumberValue(500, precision=0, step=1, min=0))
         self.setattr_argument("n_pi_low", NumberValue(1, precision=0, step=1, min=0))
         self.setattr_argument("n_pi_high", NumberValue(16, precision=0, step=1, min=0))
         self.setattr_argument("n_pi_step", NumberValue(1, precision=0, step=1, min=1))
@@ -28,7 +28,7 @@ class ARQICK_red_pi_pulse_sweep_200ps(EnvExperiment, ARQICK_DoPulses_Red):
         config.mw_gain = self.mw_gain
         config.freq_fMHz = self.freq_resonant
         config.mw_pi_tdds = int(self.pi_duration_tdds)
-        config.pi_to_pi_delay_treg = int(self.pi_to_pi_delay_treg)
+        config.pi_to_pi_delay_tdds = int(self.pi_to_pi_delay_tdds)
 
         n_pi_low = int(self.n_pi_low)
         n_pi_high = int(self.n_pi_high)
@@ -37,13 +37,18 @@ class ARQICK_red_pi_pulse_sweep_200ps(EnvExperiment, ARQICK_DoPulses_Red):
         # The sweep is inclusive of the start and end values. The plotted
         # x-axis is the actual number of pi pulses N.
         config.add_unitless_linear_sweep("n_pi", n_pi_low, n_pi_high, delta=n_pi_step)
-        self.tau_list = np.linspace(config.n_pi_start, config.n_pi_end, config.nsweep_points)
+        self.tau_list = np.arange(
+            config.n_pi_start,
+            config.n_pi_end + config.n_pi_delta,
+            config.n_pi_delta,
+            dtype=int,
+        )
         self.data_size = len(self.tau_list)
 
         n_pi_list = self.tau_list
         pulse_train_duration = (
             n_pi_list * config.mw_pi_tdds * self.qick_tdds_ns
-            + np.maximum(n_pi_list - 1, 0) * config.pi_to_pi_delay_treg * self.qick_tproc_clock_ns
+            + np.maximum(n_pi_list - 1, 0) * config.pi_to_pi_delay_tdds * self.qick_tdds_ns
         )
         self.tau_list2 = (
             pulse_train_duration

@@ -6,6 +6,10 @@ For each sweep point, this program sends a PMOD trigger and then plays
 N microwave pi pulses with alternating XY phases, where N is swept from
 n_pi_start to n_pi_end.
 
+The delay between pi pulses is specified in tdds units, giving the same
+approximately 200 ps timing granularity used by the other arqick 200 ps
+programs.
+
 This version does not include laser/ADC readout. It is meant to be used with
 external readout/triggering, similar to the arqick_*_200ps pulse-only programs.
 """
@@ -78,6 +82,10 @@ class PiPulseNumberSweep(NVAveragerProgram):
 
     where N is swept by a hardware register. The sweep axis returned by
     get_expt_pts() is the actual number of pi pulses N.
+
+    The inter-pi delay is cfg.pi_to_pi_delay_tdds in DAC-sample units. Each
+    successive pi pulse uses a shifted waveform selected by a fine-delay
+    register, while the coarse part of the delay is handled by a tProc sync.
     """
 
     required_cfg = [
@@ -105,7 +113,7 @@ class PiPulseNumberSweep(NVAveragerProgram):
         "inherent_trigger_to_pulses_delay_treg",
 
         # Pulse train timing
-        "pi_to_pi_delay_treg",     # delay between end of one pi pulse and start of next
+        "pi_to_pi_delay_tdds",     # active pi end to next active pi start
         "pulse_seq_delay_treg",    # delay after the pi-pulse train
     ]
 
@@ -126,30 +134,48 @@ class PiPulseNumberSweep(NVAveragerProgram):
         # Fine waveform timing.
         # In the arqick 200 ps files, this is expected to be 16 for the MW channel.
         self.samps_per_clk = self.soccfg["gens"][self.cfg.mw_channel]["samps_per_clk"]
+        assert self.samps_per_clk > 0
+        assert self.samps_per_clk & (self.samps_per_clk - 1) == 0, (
+            "samps_per_clk must be a power of two for bitwise fine timing."
+        )
+        self.log2_samps_per_clk = int(np.log2(self.samps_per_clk))
 
         # Arbitrary waveforms need a minimum length of a few treg units.
+        # The extra samps_per_clk - 1 samples allow all fine start offsets.
         self.pi_waveform_len_treg = max(
-            int(np.ceil(self.cfg.mw_pi_tdds / self.samps_per_clk)),
+            int(
+                np.ceil(
+                    (self.cfg.mw_pi_tdds + self.samps_per_clk - 1)
+                    / self.samps_per_clk
+                )
+            ),
             3,
         )
         self.pi_waveform_len_tdds = self.pi_waveform_len_treg * self.samps_per_clk
+        self.pi_len_unused_tdds = self.pi_waveform_len_tdds - self.cfg.mw_pi_tdds
 
-        # Build a rectangular pi pulse in I/Q waveform memory.
-        i_data = np.zeros(self.pi_waveform_len_tdds)
-        q_data = np.zeros(self.pi_waveform_len_tdds)
-
-        i_data[: self.cfg.mw_pi_tdds] = 1
-        q_data[: self.cfg.mw_pi_tdds] = 1
-
-        i_data *= self.soccfg.get_maxv(self.cfg.mw_channel)
-        q_data *= self.soccfg.get_maxv(self.cfg.mw_channel)
-
-        self.add_envelope(
-            ch=self.cfg.mw_channel,
-            name="pi",
-            idata=i_data,
-            qdata=q_data,
+        assert self.cfg.pi_to_pi_delay_tdds >= self.pi_len_unused_tdds, (
+            "pi_to_pi_delay_tdds is too short for this pi waveform. "
+            f"Use at least {self.pi_len_unused_tdds} tdds."
         )
+
+        # Build rectangular pi pulses shifted by each DAC sample offset.
+        for offset in range(self.samps_per_clk):
+            i_data = np.zeros(self.pi_waveform_len_tdds)
+            q_data = np.zeros(self.pi_waveform_len_tdds)
+
+            i_data[offset: offset + self.cfg.mw_pi_tdds] = 1
+            q_data[offset: offset + self.cfg.mw_pi_tdds] = 1
+
+            i_data *= self.soccfg.get_maxv(self.cfg.mw_channel)
+            q_data *= self.soccfg.get_maxv(self.cfg.mw_channel)
+
+            self.add_envelope(
+                ch=self.cfg.mw_channel,
+                name=f"pi_{offset}",
+                idata=i_data,
+                qdata=q_data,
+            )
 
         # Configure the MW pulse registers.
         self.default_pulse_registers(
@@ -159,6 +185,8 @@ class PiPulseNumberSweep(NVAveragerProgram):
             gain=self.cfg.mw_gain,
             phase=0,
         )
+
+        self.address_register = self.get_gen_reg(self.cfg.mw_channel, name="addr")
 
         # Swept register: current number of pi pulses.
         self.n_pi_register = self.new_gen_reg(
@@ -175,6 +203,18 @@ class PiPulseNumberSweep(NVAveragerProgram):
         )
 
         self.phase_register = self.get_gen_reg(self.cfg.mw_channel, name="phase")
+
+        self.tdds_offset_register = self.new_gen_reg(
+            self.cfg.mw_channel,
+            name="tdds_offset",
+            init_val=0,
+        )
+
+        self.treg_offset_register = self.new_gen_reg(
+            self.cfg.mw_channel,
+            name="treg_offset",
+            init_val=0,
+        )
 
         # 0 -> X phase, 1 -> Y phase. This toggles once per pi pulse.
         self.phase_step_register = self.new_gen_reg(
@@ -211,7 +251,7 @@ class PiPulseNumberSweep(NVAveragerProgram):
         # Configure the pi pulse once for this shot.
         self.set_pulse_registers(
             ch=self.cfg.mw_channel,
-            waveform="pi",
+            waveform="pi_0",
             phase=self.deg2reg(0),
         )
 
@@ -225,6 +265,7 @@ class PiPulseNumberSweep(NVAveragerProgram):
 
         # Start every train on X.
         self.phase_step_register.reset()
+        self.tdds_offset_register.reset()
 
         # If n_pi == 0, skip the pulse loop.
         self.condj(
@@ -269,7 +310,7 @@ class PiPulseNumberSweep(NVAveragerProgram):
         )
 
         # Delay before the next pi pulse.
-        self.sync_all(self.cfg.pi_to_pi_delay_treg)
+        self.configure_next_pi_pulse_delay()
 
         # Toggle X <-> Y for the next pi pulse.
         self.phase_step_register.set_to(
@@ -299,3 +340,44 @@ class PiPulseNumberSweep(NVAveragerProgram):
 
         # Delay before the next shot.
         self.sync_all(self.cfg.pulse_seq_delay_treg)
+
+    def configure_next_pi_pulse_delay(self):
+        """
+        Select the shifted pi waveform and coarse sync for the next pulse.
+
+        tdds_offset_register holds the fine offset of the current pi pulse.
+        After sync_all(), the remaining unused waveform time depends on that
+        offset. Adding the current fine offset back into the next delay keeps
+        the active pulse-to-pulse gap equal to pi_to_pi_delay_tdds.
+        """
+        self.tdds_offset_register.set_to(
+            self.tdds_offset_register,
+            "+",
+            self.cfg.pi_to_pi_delay_tdds - self.pi_len_unused_tdds,
+            physical_unit=False,
+        )
+
+        self.bitwi(
+            self.tdds_offset_register.page,
+            self.treg_offset_register.addr,
+            self.tdds_offset_register.addr,
+            ">>",
+            self.log2_samps_per_clk,
+        )
+
+        self.bitwi(
+            self.tdds_offset_register.page,
+            self.tdds_offset_register.addr,
+            self.tdds_offset_register.addr,
+            "&",
+            self.samps_per_clk - 1,
+        )
+
+        self.address_register.set_to(
+            self.tdds_offset_register,
+            "*",
+            self.pi_waveform_len_treg,
+            physical_unit=False,
+        )
+
+        self.sync(self.treg_offset_register.page, self.treg_offset_register.addr)
