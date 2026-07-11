@@ -3,6 +3,10 @@ import pytest
 
 from conftest import FakeRegister
 from qickdawg.arqick.arqick_pi_count_sweep import IntegerRegisterSweep
+from qickdawg.arqick.arqick_pi_count_sweep import (
+    _build_fine_timing_layout,
+    _validate_common_clock,
+)
 
 
 @pytest.mark.parametrize(
@@ -62,3 +66,59 @@ def test_integer_register_sweep_rejects_invalid_ranges(
         IntegerRegisterSweep(
             object(), FakeRegister(), start, stop, expts
         )
+
+
+def test_fine_timing_layout_accounts_for_maximum_shift():
+    layout = _build_fine_timing_layout(190, 500, 16)
+
+    assert layout.samps_per_clk == 16
+    assert layout.log2_samps_per_clk == 4
+    assert layout.waveform_len_treg == 13
+    assert layout.waveform_len_tdds == 208
+    assert layout.unused_tail_tdds == 18
+    assert layout.interpulse_stride_tdds == 482
+
+
+@pytest.mark.parametrize(
+    ("duration", "gap", "samps", "exception"),
+    [
+        (0, 500, 16, ValueError),
+        (190, -1, 16, ValueError),
+        (190, 17, 16, ValueError),
+        (190, 500, 0, ValueError),
+        (190, 500, 12, ValueError),
+        (190.0, 500, 16, TypeError),
+    ],
+)
+def test_fine_timing_layout_rejects_invalid_geometry(
+    duration, gap, samps, exception
+):
+    with pytest.raises(exception):
+        _build_fine_timing_layout(duration, gap, samps)
+
+
+def test_common_clock_validation_accepts_lab_clock():
+    soccfg = {
+        "gens": [{"f_fabric": 307.2}],
+        "tprocs": [{"f_time": 307.2}],
+    }
+
+    _validate_common_clock(soccfg, 0)
+
+
+@pytest.mark.parametrize(
+    "soccfg",
+    [
+        {
+            "gens": [{"f_fabric": 250.0}],
+            "tprocs": [{"f_time": 307.2}],
+        },
+        {
+            "gens": [{"f_fabric": 0.0}],
+            "tprocs": [{"f_time": 0.0}],
+        },
+    ],
+)
+def test_common_clock_validation_rejects_incompatible_firmware(soccfg):
+    with pytest.raises(ValueError, match="common clock"):
+        _validate_common_clock(soccfg, 0)
