@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from qick.averager_program import AbsQickSweep
+from qickdawg.nvpulsing.nvaverageprogram import NVAveragerProgram
 
 
 def _require_python_int(name, value):
@@ -135,4 +136,217 @@ class IntegerRegisterSweep(AbsQickSweep):
     def get_sweep_pts(self):
         return self.start + self.step * np.arange(
             self.expts, dtype=np.int64
+        )
+
+
+class PiPulseNumberSweep(NVAveragerProgram):
+    """Sweep a bare XYXY pi-pulse train on the fine DAC timing grid."""
+
+    required_cfg = [
+        "mw_pi_tdds",
+        "pi_to_pi_delay_tdds",
+        "n_pi_start",
+        "n_pi_end",
+        "nsweep_points",
+        "freq_freg",
+        "mw_channel",
+        "mw_nqz",
+        "mw_gain",
+        "reps",
+        "pmod_out_pin",
+        "pmod_out_pulse_width_treg",
+        "pmod_out_trig_delay_treg",
+        "inherent_trigger_to_pulses_delay_treg",
+        "pulse_seq_delay_treg",
+    ]
+
+    def initialize(self):
+        missing = [name for name in self.required_cfg if name not in self.cfg]
+        if missing:
+            raise ValueError(
+                "missing required pi-count configuration fields: "
+                + ", ".join(missing)
+            )
+
+        mw_channel = _require_python_int(
+            "mw_channel", self.cfg.mw_channel
+        )
+        _validate_common_clock(self.soccfg, mw_channel)
+        generator_cfg = self.soccfg["gens"][mw_channel]
+        layout = _build_fine_timing_layout(
+            self.cfg.mw_pi_tdds,
+            self.cfg.pi_to_pi_delay_tdds,
+            generator_cfg["samps_per_clk"],
+        )
+        phase_bits = _require_python_int(
+            "b_phase", generator_cfg["b_phase"]
+        )
+        if phase_bits < 2:
+            raise ValueError("generator b_phase must be at least 2")
+
+        self.declare_gen(ch=mw_channel, nqz=self.cfg.mw_nqz)
+        self.samps_per_clk = layout.samps_per_clk
+        self.log2_samps_per_clk = layout.log2_samps_per_clk
+        self.pi_waveform_len_treg = layout.waveform_len_treg
+        self.pi_waveform_len_tdds = layout.waveform_len_tdds
+        self.pi_len_unused_tdds = layout.unused_tail_tdds
+        self.interpulse_stride_tdds = layout.interpulse_stride_tdds
+        self.phase_shift = phase_bits - 2
+
+        maxv = self.soccfg.get_maxv(mw_channel)
+        for offset in range(self.samps_per_clk):
+            idata = np.zeros(self.pi_waveform_len_tdds)
+            qdata = np.zeros(self.pi_waveform_len_tdds)
+            active = slice(offset, offset + self.cfg.mw_pi_tdds)
+            idata[active] = maxv
+            qdata[active] = maxv
+            self.add_envelope(
+                ch=mw_channel,
+                name=f"pi_{offset}",
+                idata=idata,
+                qdata=qdata,
+            )
+
+        self.default_pulse_registers(
+            ch=mw_channel,
+            style="arb",
+            freq=self.cfg.freq_freg,
+            gain=self.cfg.mw_gain,
+        )
+        self.set_pulse_registers(
+            ch=mw_channel,
+            waveform="pi_0",
+            phase=0,
+        )
+
+        self.address_register = self.get_gen_reg(mw_channel, name="addr")
+        self.phase_register = self.get_gen_reg(mw_channel, name="phase")
+        self.n_pi_register = self.new_gen_reg(
+            mw_channel, name="n_pi", init_val=self.cfg.n_pi_start
+        )
+        self.pi_counter_register = self.new_gen_reg(
+            mw_channel, name="pi_counter", init_val=0
+        )
+        self.tdds_offset_register = self.new_gen_reg(
+            mw_channel, name="tdds_offset", init_val=0
+        )
+        self.treg_offset_register = self.new_gen_reg(
+            mw_channel, name="treg_offset", init_val=0
+        )
+        self.phase_step_register = self.new_gen_reg(
+            mw_channel, name="phase_step", init_val=0
+        )
+
+        self.add_sweep(
+            IntegerRegisterSweep(
+                self,
+                self.n_pi_register,
+                self.cfg.n_pi_start,
+                self.cfg.n_pi_end,
+                self.cfg.nsweep_points,
+                label="n_pi",
+            )
+        )
+        self.synci(200)
+
+    def body(self):
+        self.sync_all(
+            self.cfg.inherent_trigger_to_pulses_delay_treg
+        )
+        self.trigger(
+            pins=[self.cfg.pmod_out_pin],
+            width=self.cfg.pmod_out_pulse_width_treg,
+        )
+        self.sync_all(self.cfg.pmod_out_trig_delay_treg)
+
+        self.pi_counter_register.set_to(
+            self.n_pi_register, "+", 0, physical_unit=False
+        )
+        self.tdds_offset_register.reset()
+        self.treg_offset_register.reset()
+        self.phase_step_register.reset()
+        self.address_register.set_to(0, physical_unit=False)
+
+        self.condj(
+            self.pi_counter_register.page,
+            self.pi_counter_register.addr,
+            "==",
+            0,
+            "PI_LOOP_END",
+        )
+
+        self.label("PI_LOOP")
+        self.bitwi(
+            self.phase_register.page,
+            self.phase_register.addr,
+            self.phase_step_register.addr,
+            "<<",
+            self.phase_shift,
+        )
+        self.pulse(ch=self.cfg.mw_channel)
+        self.sync_all()
+
+        self.pi_counter_register.set_to(
+            self.pi_counter_register, "-", 1, physical_unit=False
+        )
+        self.condj(
+            self.pi_counter_register.page,
+            self.pi_counter_register.addr,
+            "==",
+            0,
+            "PI_LOOP_END",
+        )
+
+        self._configure_next_pi_start()
+        self.phase_step_register.set_to(
+            self.phase_step_register, "+", 1, physical_unit=False
+        )
+        self.bitwi(
+            self.phase_step_register.page,
+            self.phase_step_register.addr,
+            self.phase_step_register.addr,
+            "&",
+            1,
+        )
+        self.condj(
+            self.pi_counter_register.page,
+            self.pi_counter_register.addr,
+            ">",
+            0,
+            "PI_LOOP",
+        )
+
+        self.label("PI_LOOP_END")
+        self.synci(self.cfg.pulse_seq_delay_treg)
+
+    def _configure_next_pi_start(self):
+        self.tdds_offset_register.set_to(
+            self.tdds_offset_register,
+            "+",
+            self.interpulse_stride_tdds,
+            physical_unit=False,
+        )
+        self.bitwi(
+            self.tdds_offset_register.page,
+            self.treg_offset_register.addr,
+            self.tdds_offset_register.addr,
+            ">>",
+            self.log2_samps_per_clk,
+        )
+        self.bitwi(
+            self.tdds_offset_register.page,
+            self.tdds_offset_register.addr,
+            self.tdds_offset_register.addr,
+            "&",
+            self.samps_per_clk - 1,
+        )
+        self.address_register.set_to(
+            self.tdds_offset_register,
+            "*",
+            self.pi_waveform_len_treg,
+            physical_unit=False,
+        )
+        self.sync(
+            self.treg_offset_register.page,
+            self.treg_offset_register.addr,
         )
