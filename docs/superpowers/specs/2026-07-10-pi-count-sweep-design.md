@@ -115,7 +115,7 @@ Because a generator cannot begin a new envelope while the previous padded envelo
 
 Create:
 
-`artiq-master/repository/arqick_sequences/arqick_artiq_red_pi_pulse_sweep_200ps.py`
+`artiq-master/repository/arqick_sequences/arqick_artiq_red_pi_count_sweep_200ps.py`
 
 The experiment class will inherit from `EnvExperiment` and `ARQICK_DoPulses_Red`, matching the modern red ARQICK experiments in `dqpcomputer-pr`.
 
